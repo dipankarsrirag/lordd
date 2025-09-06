@@ -1,205 +1,160 @@
 import argparse
 import os
+import warnings
 from tqdm import tqdm
 import pathlib
 
-from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
 import torch
+from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from torch import nn
 
 import pandas as pd
 from datasets import Dataset
 
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, BitsAndBytesConfig
+
 import bitsandbytes as bnb
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-import warnings
 
 warnings.filterwarnings("ignore")
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-os.environ["WANDB_MODE"] = "disabled"
-os.environ["CUDA_VISIBLE_DEVICE"] = "0"
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
-dtype = torch.bfloat16
-
+# -----------------
+# Global constants
+# -----------------
 MAX_LEN = 512
+DTYPE = torch.bfloat16
 
 
-def convert_embeddings_to_tensor(dataset):
-    tensor_embeddings = []
-
-    for embeddings in dataset:
-        tensor_embedding = torch.stack(
-            [torch.tensor(embedding) for embedding in embeddings]
-        )
-        tensor_embeddings.append(tensor_embedding)
-
-    original_embedding_tensor = torch.stack(tensor_embeddings)
-    return original_embedding_tensor
+# -----------------
+# Helper functions
+# -----------------
+def set_env():
+    os.environ.setdefault("WANDB_MODE", "disabled")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")  # plural
 
 
 def find_all_linear_names(model):
+    """
+    Find all 4-bit linear modules to target with LoRA.
+    """
     cls = bnb.nn.Linear4bit
     lora_module_names = set()
     for name, module in model.named_modules():
         if isinstance(module, cls):
-            names = name.split(".")
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-    return list(lora_module_names)
+            parts = name.split(".")
+            lora_module_names.add(parts[-1] if len(parts) > 0 else name)
+    return sorted(list(lora_module_names))
 
 
 def get_prompt(data, label="original", model="mistral"):
     if model == "mistral":
-        prompt = """<s> [INST] From the conversation, Replace "[MASK]" with the most relevant word. Generate a single token, do not give explanation.\nConversation:{} [/INST]"""
+        prompt = (
+            "<s> [INST] From the conversation, Replace \"[MASK]\" with the most relevant word. "
+            "Generate a single token, do not give explanation.\nConversation:{} [/INST]"
+        )
     elif model == "gemma":
-        prompt = """<start_of_turn>user From the conversation, Replace "[MASK]" with the most relevant word. Generate a single token, do not give explanation.\nConversation:{} <end_of_turn>"""
+        prompt = (
+            "<start_of_turn>user From the conversation, Replace \"[MASK]\" with the most relevant word. "
+            "Generate a single token, do not give explanation.\nConversation:{} <end_of_turn>"
+        )
     else:
-        raise NotImplementedError
-
-    prompts = []
-    for text in data[label]:
-        prompts.append(prompt.format(text))
-    return prompts
+        raise NotImplementedError(f"Unknown model prompt style: {model}")
+    return [prompt.format(text) for text in data[label]]
 
 
-def train_model_with_supconloss(
-    model,
-    tokenizer,
-    dataset,
-    adaptor_dir,
-    device,
-    num_epochs=10,
-    batch_size=16,
-    learning_rate=2e-5,
-    patience=3,
-):
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    optimizer = AdamW(model.parameters(), lr=learning_rate)
-    model.train()
+def gather_mask_vec_from_last_layer(hidden_states, input_ids, attention_mask, tokenizer, reduce="mean"):
+    """
+    hidden_states: tuple length L; each [B, T, H]
+    input_ids: [B, T] LongTensor
+    attention_mask: [B, T] LongTensor
+    Returns: [B, H] pooled at positions where token == mask_token_id.
+    If absent, falls back to last real token (by attention_mask).
+    If multiple [MASK] tokens exist, pools across them (mean/first/max).
+    """
+    last = hidden_states[-1]  # [B, T, H]
+    B, T, H = last.shape
+    reps = []
+    mask_id = tokenizer.mask_token_id
+    pad_id = tokenizer.pad_token_id
 
-    criterion = nn.CosineEmbeddingLoss(margin=0.25, reduction="mean")
+    for b in range(B):
+        ids = input_ids[b]
+        am = attention_mask[b]
+        mask_positions = (ids == mask_id).nonzero(as_tuple=False).flatten()
 
-    mask_token_id = tokenizer.mask_token_id
-
-    best_loss = float("inf")
-    epochs_no_improve = 0
-    early_stop = False
-
-    for epoch in range(num_epochs):
-        if early_stop:
-            print("Early stopping triggered. Training halted.")
-            break
-
-        total_loss = 0.0
-        for batch in tqdm(dataloader, desc=f"Training Epoch {epoch + 1}/{num_epochs}"):
-            transformed_input_ids = torch.stack(
-                [example for example in batch["input_ids"]]
-            ).to(device)
-
-            transformed_attention_mask = torch.stack(
-                [example for example in batch["attention_mask"]]
-            ).to(device)
-
-            original_hidden_mask = (
-                convert_embeddings_to_tensor(batch["original_embedding"])
-                .permute([2, 0, 1])
-                .mean(dim=2)
-                .to(device)
-            )
-
-            transformed_outputs = model(
-                input_ids=transformed_input_ids,
-                attention_mask=transformed_attention_mask,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            transformed_hidden_mask = (
-                torch.stack(
-                    [
-                        hidden_state[mask_token_id, :, :]
-                        for hidden_state in transformed_outputs.hidden_states
-                    ],
-                )
-                .permute([1, 0, 2])
-                .mean(dim=2)
-                .to(device)
-            )
-
-            if original_hidden_mask.dtype != transformed_hidden_mask.dtype:
-                transformed_hidden_mask = transformed_hidden_mask.type(
-                    original_hidden_mask.dtype
-                )
-
-            labels = torch.tensor(batch["label"], dtype=torch.float).to(device)
-
-            seq_loss = criterion(original_hidden_mask, transformed_hidden_mask, labels)
-
-            if torch.isnan(seq_loss).any():
-                print("NaNs detected in sequence loss.")
-                continue
-
-            optimizer.zero_grad()
-            seq_loss.backward()
-
-            optimizer.step()
-            total_loss += seq_loss.item()
-
-            print(f"Seq Loss: {seq_loss.item()}")
-
-        avg_loss = total_loss / len(dataloader)
-        print(f"Epoch {epoch + 1}/{num_epochs} | Average Seq Loss: {avg_loss:.4f}")
-
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            epochs_no_improve = 0
-            model.save_pretrained(adaptor_dir)
+        if mask_positions.numel() > 0:
+            vecs = last[b, mask_positions, :]  # [M, H]
+            if reduce == "mean":
+                vec = vecs.mean(dim=0)
+            elif reduce == "first":
+                vec = vecs[0]
+            elif reduce == "max":
+                vec = vecs.max(dim=0).values
+            else:
+                vec = vecs.mean(dim=0)
         else:
-            epochs_no_improve += 1
+            # Fallback: last non-pad (or last where attention_mask==1)
+            if am.any():
+                j = (am.nonzero(as_tuple=False).flatten())[-1].item()
+            else:
+                # last non-pad id
+                non_pad = (ids != pad_id).nonzero(as_tuple=False).flatten()
+                j = non_pad[-1].item() if non_pad.numel() > 0 else 0
+            vec = last[b, j, :]
 
-        if epochs_no_improve >= patience:
-            print(f"Early stopping: No improvement in {patience} epochs.")
-            early_stop = True
+        reps.append(vec)
 
-    print("Training complete.")
+    return torch.stack(reps, dim=0)  # [B, H]
 
 
 def get_model_tokenizer(
-    model_id,
-    attn_implementation,
-    use_lora,
-    task_type,
-    lora_alpha,
-    lora_r,
-    lora_dropout,
-    lora_bias,
+    model_id: str,
+    attn_implementation: str = None,
+    use_lora: bool = False,
+    task_type: str = "CAUSAL_LM",
+    lora_alpha: float = 16,
+    lora_r: int = 8,
+    lora_dropout: float = 0.0,
+    lora_bias: str = "none",
+    prefer_causal_lm: bool = True,
 ):
-
+    """
+    Load a 4-bit model + tokenizer. Optionally wrap with LoRA.
+    Returns model, tokenizer.
+    """
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=DTYPE,
     )
 
-    model = AutoModel.from_pretrained(
+    ModelClass = AutoModelForCausalLM if prefer_causal_lm else AutoModel
+
+    model = ModelClass.from_pretrained(
         model_id,
         device_map="auto",
         attn_implementation=attn_implementation,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=DTYPE,
         quantization_config=bnb_config,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    if use_lora:
-        print("Return a PEFT Model")
-        modules = find_all_linear_names(model)
-        print(modules)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'
+    tokenizer.add_special_tokens({"mask_token": "[MASK]"})
+    model.resize_token_embeddings(len(tokenizer))
 
-        model.gradient_checkpointing_enable()
+    if use_lora:
+        print("Wrapping model with PEFT LoRA adapters...")
+        modules = find_all_linear_names(model)
+        print("LoRA target modules:", modules)
+
+        # Prepare for k-bit finetuning
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
         model = prepare_model_for_kbit_training(model)
 
         peft_config = LoraConfig(
@@ -212,115 +167,243 @@ def get_model_tokenizer(
         )
 
         model = get_peft_model(model, peft_config)
-        model.print_trainable_parameters()
+        try:
+            model.print_trainable_parameters()
+        except Exception:
+            pass
 
     return model, tokenizer
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Description of your program")
-    parser.add_argument("model_id", type=str)
-    parser.add_argument("model_name", type=str)
-    parser.add_argument("attn_implementation", type=str)
-    parser.add_argument("use_lora", action="store_true")
-    parser.add_argument("task_type", type=str)
-    parser.add_argument("lora_alpha", type=float)
-    parser.add_argument("lora_r", type=float)
-    parser.add_argument("lora_dropout", type=float)
-    parser.add_argument("lora_bias")
-    parser.add_argument("learning_rate", type=float)
-    parser.add_argument("batch_size", type=int)
-    parser.add_argument("data_path", type=pathlib.Path)
-    parser.add_argument("adaptor_dir", type=pathlib.Path)
-
-    args = parser.parse_args()
-    return args
-
-
-def main():
-
-    args = parse_args()
-
-    def tokenize_text(examples):
-        result = tokenizer(
-            examples["transformed"], padding="max_length", max_length=MAX_LEN
+def tokenize_text_factory(tokenizer, max_len, field_name):
+    def _fn(examples):
+        res = tokenizer(
+            examples[field_name],
+            padding="max_length",
+            truncation=True,
+            max_length=max_len,
+            return_tensors=None,
         )
-        return result
+        return res
+    return _fn
 
-    def get_original_embeddings(examples):
-        result = tokenizer(
-            examples["original"], padding="max_length", max_length=MAX_LEN
+
+def compute_original_embeddings_factory(model, tokenizer, batch_size):
+    """
+    Pre-compute the [B,H] anchor vectors for the 'original' prompts at true [MASK] positions.
+    """
+    def _fn(examples):
+        tok = tokenizer(
+            examples["original"],
+            padding="max_length",
+            truncation=True,
+            max_length=MAX_LEN,
+            return_tensors=None,
         )
-        mask_token_id = tokenizer.mask_token_id
-        original_embeddings = []
-        batch_size = args.batch_size
-        for i in range(0, len(result["input_ids"]), batch_size):
-            input_ids_batch = torch.tensor(result["input_ids"][i : i + batch_size]).to(
-                device
-            )
-            attention_mask_batch = torch.tensor(
-                result["attention_mask"][i : i + batch_size]
-            ).to(device)
+        N = len(tok["input_ids"])
+        original_vecs = []
+
+        # With device_map='auto', keep tensors on CPU and let HF route internally
+        for i in range(0, N, batch_size):
+            input_ids = torch.tensor(tok["input_ids"][i:i+batch_size])
+            attention_mask = torch.tensor(tok["attention_mask"][i:i+batch_size])
 
             model.eval()
             with torch.no_grad():
                 outputs = model(
-                    input_ids_batch,
-                    attention_mask_batch,
-                    output_attentions=False,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
                     output_hidden_states=True,
                     return_dict=True,
                 )
-            hidden_mat = (
-                torch.stack(
-                    [
-                        hidden_state[:, mask_token_id, :]
-                        for hidden_state in outputs.hidden_states
-                    ],
-                )
-                .permute([1, 0, 2])
-                .detach()
-                .cpu()
-            )
-            hidden_mat = hidden_mat.squeeze(1)
-            torch.cuda.empty_cache()
 
-            original_embeddings.extend(hidden_mat.numpy())
+            vecs = gather_mask_vec_from_last_layer(
+                outputs.hidden_states, input_ids, attention_mask, tokenizer, reduce="mean"
+            ).to("cpu").to(DTYPE)
 
-            del input_ids_batch, attention_mask_batch, outputs, hidden_mat
-            torch.cuda.empty_cache()
+            original_vecs.extend(vecs.numpy())
 
-        examples["original_embedding"] = original_embeddings
+            del input_ids, attention_mask, outputs, vecs
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        examples["original_embedding"] = original_vecs  # each element is [H]
         return examples
+    return _fn
 
-    def get_data(path, batch_size):
-        data = pd.read_json(path)
-        data["original"] = get_prompt(
-            data=data, label="original", model=args.model_name
-        )
-        data["transformed"] = get_prompt(
-            data=data, label="transformed", model=args.model_name
-        )
 
-        dataset = Dataset.from_pandas(data)
+def collate_fn(batch):
+    """
+    Build a batch of tensors. We expect each example to contain:
+    - input_ids, attention_mask (for 'transformed' prompts)
+    - label (float: +1 or -1)
+    - original_embedding: [H]
+    """
+    input_ids = torch.tensor([ex["input_ids"] for ex in batch], dtype=torch.long)
+    attention_mask = torch.tensor([ex["attention_mask"] for ex in batch], dtype=torch.long)
+    labels = torch.tensor([ex["label"] for ex in batch], dtype=torch.float)
+    original_embedding = torch.tensor([ex["original_embedding"] for ex in batch], dtype=DTYPE)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "label": labels,
+        "original_embedding": original_embedding,
+    }
 
-        dataset = dataset.map(
-            tokenize_text,
-            batched=True,
-            batch_size=batch_size,
-            load_from_cache_file=True,
-            desc="Running tokenizer on dataset",
-        )
 
-        dataset = dataset.map(
-            get_original_embeddings,
-            batched=True,
-            batch_size=batch_size,
-            load_from_cache_file=True,
-            desc="Original Embeddings for Untransformed Input",
-        )
+def train_contrastive(
+    model,
+    tokenizer,
+    dataset,
+    adaptor_dir: str,
+    num_epochs: int = 10,
+    batch_size: int = 16,
+    learning_rate: float = 2e-5,
+    patience: int = 3,
+    margin: float = 0.25,
+):
+    """
+    Train with CosineEmbeddingLoss on [MASK] vectors:
+    - anchor: precomputed original [B,H]
+    - positive/negative: transformed [B,H]
+    """
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    optimizer = AdamW(model.parameters(), lr=learning_rate)
+    criterion = nn.CosineEmbeddingLoss(margin=margin, reduction="mean")
 
-        return dataset
+    best_loss = float("inf")
+    epochs_no_improve = 0
+
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        total_loss = 0.0
+
+        for batch in tqdm(dataloader, desc=f"Training Epoch {epoch}/{num_epochs}"):
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            labels = batch["label"].to(DTYPE)  # +1 / -1
+            original_hidden = batch["original_embedding"].to(DTYPE)  # [B,H]
+
+            outputs = model(
+                input_ids=input_ids,               # keep CPU tensors for device_map='auto'
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            transformed_hidden = gather_mask_vec_from_last_layer(
+                outputs.hidden_states, input_ids, attention_mask, tokenizer, reduce="mean"
+            ).to(DTYPE)
+
+            # Put both on same device as transformed_hidden (typically CPU under auto routing)
+            device = transformed_hidden.device
+            labels = labels.to(device)
+            original_hidden = original_hidden.to(device)
+
+            loss = criterion(transformed_hidden, original_hidden, labels)
+
+            if torch.isnan(loss):
+                continue
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        avg_loss = total_loss / max(1, len(dataloader))
+        print(f"Epoch {epoch}/{num_epochs} | Average Loss: {avg_loss:.6f}")
+
+        # Early stopping + save best
+        if avg_loss < best_loss - 1e-6:
+            best_loss = avg_loss
+            epochs_no_improve = 0
+            try:
+                model.save_pretrained(adaptor_dir)
+                if hasattr(tokenizer, "save_pretrained"):
+                    tokenizer.save_pretrained(adaptor_dir)
+                print(f"Saved adapter to: {adaptor_dir}")
+            except Exception as e:
+                print(f"Warning: could not save adapter: {e}")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"Early stopping after {patience} epochs without improvement.")
+                break
+
+    print("Training complete.")
+
+
+def get_data(args, model, tokenizer):
+    """
+    Reads JSON, builds prompts, tokenizes transformed, precomputes original embeddings.
+    """
+    df = pd.read_json(args.data_path)
+    if "original" not in df.columns or "transformed" not in df.columns or "label" not in df.columns:
+        raise ValueError("JSON must contain 'original', 'transformed', and 'label' fields.")
+
+    df["original"] = get_prompt(df, label="original", model=args.model_name)
+    df["transformed"] = get_prompt(df, label="transformed", model=args.model_name)
+
+    dataset = Dataset.from_pandas(df)
+
+    # Tokenize 'transformed' prompts -> these will be fed during training
+    dataset = dataset.map(
+        tokenize_text_factory(tokenizer, MAX_LEN, "transformed"),
+        batched=True,
+        batch_size=args.batch_size,
+        load_from_cache_file=True,
+        desc="Tokenizing transformed prompts",
+    )
+
+    # Precompute anchor embeddings for the 'original' prompts
+    dataset = dataset.map(
+        compute_original_embeddings_factory(model, tokenizer, args.batch_size),
+        batched=True,
+        batch_size=args.batch_size,
+        load_from_cache_file=True,
+        desc="Precomputing original embeddings",
+    )
+
+    # Keep only necessary columns
+    keep_cols = ["input_ids", "attention_mask", "label", "original_embedding"]
+    dataset = dataset.remove_columns([c for c in dataset.column_names if c not in keep_cols])
+    return dataset
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Contrastive training with true [MASK] token (CosineEmbeddingLoss).")
+    p.add_argument("--model_id", type=str, required=True, help="HF model id (e.g., mistralai/Mistral-7B-Instruct-v0.2)")
+    p.add_argument("--model_name", type=str, choices=["mistral", "gemma"], default="mistral", help="Prompt style preset")
+    p.add_argument("--attn_implementation", type=str, default=None, help="eager | flash_attention_2 | sdpa, etc.")
+
+    # LoRA options
+    p.add_argument("--use_lora", action="store_true", help="Enable LoRA adapters")
+    p.add_argument("--task_type", type=str, default="CAUSAL_LM", help="PEFT task type, usually CAUSAL_LM")
+    p.add_argument("--lora_alpha", type=float, default=16.0)
+    p.add_argument("--lora_r", type=int, default=8)
+    p.add_argument("--lora_dropout", type=float, default=0.0)
+    p.add_argument("--lora_bias", type=str, default="none")
+
+    # Training
+    p.add_argument("--learning_rate", type=float, default=2e-5)
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--num_epochs", type=int, default=10)
+    p.add_argument("--patience", type=int, default=3)
+    p.add_argument("--margin", type=float, default=0.25)
+
+    # Data / output
+    p.add_argument("--data_path", type=pathlib.Path, required=True)
+    p.add_argument("--adaptor_dir", type=pathlib.Path, required=True)
+
+    args = p.parse_args()
+    return args
+
+
+def main():
+    set_env()
+    args = parse_args()
 
     model, tokenizer = get_model_tokenizer(
         model_id=args.model_id,
@@ -331,18 +414,21 @@ def main():
         lora_r=args.lora_r,
         lora_dropout=args.lora_dropout,
         lora_bias=args.lora_bias,
+        prefer_causal_lm=True,
     )
 
-    dataset = get_data(path=args.data_path, batch_size=args.batch_size)
+    dataset = get_data(args, model, tokenizer)
 
-    train_model_with_supconloss(
+    train_contrastive(
         model=model,
         tokenizer=tokenizer,
         dataset=dataset,
-        device=device,
-        adaptor_dir=args.adaptor_dir,
+        adaptor_dir=str(args.adaptor_dir),
+        num_epochs=args.num_epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        patience=args.patience,
+        margin=args.margin,
     )
 
 
