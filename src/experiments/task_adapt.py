@@ -82,6 +82,11 @@ def get_model_tokenizer(
         quantization_config=bnb_config,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'
+
+    tokenizer.add_special_tokens({"mask_token": "[MASK]"})
+    model.resize_token_embeddings(len(tokenizer))
 
     if use_lora:
         print("Return a PEFT Model")
